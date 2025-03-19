@@ -9,6 +9,8 @@ use structopt::StructOpt;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore; // 用于计时
+mod md5_vec; // 引入 md5_vec 模块
+use md5::{Digest, Md5}; // 引入 MD5 计算库
 
 #[derive(StructOpt)]
 struct Cli {
@@ -68,16 +70,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     // 处理目标页面，包括提取图片 URL 和下载图片
-    process_page(&client, &target_url, &args.proxy_url).await?;
+    process_page(
+        &client,
+        &target_url,
+        &args.proxy_url,
+        &md5_vec::KNOWN_MD5_HASHES,
+    )
+    .await?;
 
     Ok(())
 }
 
 /// 处理单个页面的逻辑
 async fn process_page(
-    client: &Client, // HTTP 客户端
-    url: &str,       // 页面的目标 URL
-    proxy_url: &str, // 代理前缀 URL
+    client: &Client,     // HTTP 客户端
+    url: &str,           // 页面的目标 URL
+    proxy_url: &str,     // 代理前缀 URL
+    md5_hashes: &[&str], // 提供的 MD5 值列表
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 获取页面内容
     let response = client.get(url).send().await?;
@@ -99,7 +108,7 @@ async fn process_page(
     let start_time = Instant::now();
 
     // 下载图片到指定文件夹
-    download_images(client, &folder_path, image_urls).await?;
+    download_images(client, &folder_path, image_urls, md5_hashes).await?;
 
     // 计算并打印图片下载总耗时
     let elapsed_time = start_time.elapsed();
@@ -168,11 +177,11 @@ fn collect_image_urls(
 }
 
 /// 下载图片到指定文件夹
-/// 下载图片到指定文件夹
 async fn download_images(
     client: &Client,         // HTTP 客户端
     folder_path: &Path,      // 文件夹路径
     image_urls: Vec<String>, // 图片 URL 列表
+    md5_hashes: &[&str],     // 提供的 MD5 值列表
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 使用信号量限制并发数，防止过多请求导致被封禁
     let concurrency_limit = Arc::new(Semaphore::new(3));
@@ -188,6 +197,7 @@ async fn download_images(
             let client = client.clone();
             let concurrency_limit = Arc::clone(&concurrency_limit);
             let folder_path = folder_path.to_owned();
+            let md5_hashes = md5_hashes.to_owned();
 
             async move {
                 // 获取信号量许可，限制并发数
@@ -222,10 +232,28 @@ async fn download_images(
                     if bytes.len() < 1024 {
                         retries -= 1;
                         println!(
-                            "图片大小小于 1KB，可能下载失败，剩余重试次数: {}",
-                            retries
+                            "{} 图片大小小于 1KB，可能下载失败，剩余重试次数: {}",
+                            img_url, retries
                         );
                         continue;
+                    }
+
+                    // 计算图片的 MD5 值
+                    let mut hasher = Md5::new();
+                    hasher.update(&bytes);
+                    let result = hasher.finalize();
+                    let md5_hash = format!("{:x}", result); // 将 MD5 值转换为十六进制字符串
+
+                    // 打印图片的 MD5 值
+                    println!("图片 {} 的 MD5 值为: {}", img_url, md5_hash);
+
+                    // 检查 MD5 值是否在提供的列表中
+                    if md5_hashes.contains(&md5_hash.as_str()) {
+                        println!(
+                            "图片 {} 的 MD5 值已存在 ({})，跳过下载。",
+                            img_url, md5_hash
+                        );
+                        break; // 跳过该图片的下载
                     }
 
                     // 获取图片扩展名
@@ -277,7 +305,9 @@ fn get_extension(bytes: &[u8]) -> Option<&'static str> {
         Some("webp") // WebP 格式
     } else if bytes.starts_with(&[0x42, 0x4D]) {
         Some("bmp") // BMP 格式
-    } else if bytes.starts_with(&[0x49, 0x49, 0x2A, 0x00]) || bytes.starts_with(&[0x4D, 0x4D, 0x00, 0x2A]) {
+    } else if bytes.starts_with(&[0x49, 0x49, 0x2A, 0x00])
+        || bytes.starts_with(&[0x4D, 0x4D, 0x00, 0x2A])
+    {
         Some("tiff") // TIFF 格式
     } else if bytes.starts_with(&[0x00, 0x00, 0x01, 0x00]) {
         Some("ico") // ICO 格式
